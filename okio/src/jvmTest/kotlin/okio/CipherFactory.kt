@@ -6,6 +6,8 @@ import javax.crypto.spec.SecretKeySpec
 import kotlin.random.Random
 
 class CipherFactory(
+  val key: ByteArray,
+  val iv: ByteArray,
   private val transformation: String,
   private val init: Cipher.(mode: Int) -> Unit
 ) {
@@ -34,14 +36,14 @@ data class CipherAlgorithm(
   fun createCipherFactory(random: Random): CipherFactory {
     val key = random.nextBytes(keyLength)
     val secretKeySpec = SecretKeySpec(key, transformation.substringBefore('/'))
+    val iv = random.nextBytes(ivLength ?: 0)
     return if (ivLength == null) {
-      CipherFactory(transformation) { mode ->
+      CipherFactory(key, iv, transformation) { mode ->
         init(mode, secretKeySpec)
       }
     } else {
-      val iv = random.nextBytes(ivLength)
       val ivParameterSpec = IvParameterSpec(iv)
-      CipherFactory(transformation) { mode ->
+      CipherFactory(key, iv, transformation) { mode ->
         init(mode, secretKeySpec, ivParameterSpec)
       }
     }

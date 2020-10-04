@@ -20,21 +20,17 @@
 package okio
 
 import java.io.IOException
-import javax.crypto.Cipher
+import kotlin.math.min
 
 private class CipherSink(
   private val sink: BufferedSink,
-  private val cipher: Cipher
+  private val cipher: BlockCipher
 ) : Sink {
 
-  private val blockSize = cipher.blockSize
-  private var closed = false
+  private val buffer = ByteArray(AESEngine.BLOCK_SIZE)
+  private var bufferSize = 0
 
-  init {
-    // Require block cipher, and check for unsupported (too large) block size (should never happen with standard algorithms)
-    require(blockSize > 0) { "Block cipher required $cipher" }
-    require(blockSize <= Segment.SIZE) { "Cipher block size $blockSize too large $cipher" }
-  }
+  private var closed = false
 
   @Throws(IOException::class)
   override fun write(source: Buffer, byteCount: Long) {
@@ -50,32 +46,67 @@ private class CipherSink(
 
   private fun update(source: Buffer, remaining: Long): Int {
     val head = source.head!!
-    val size = minOf(remaining, head.limit - head.pos).toInt()
-    val buffer = sink.buffer
+    val headSize = min(head.limit - head.pos, remaining.toInt())
 
-    // For block cipher, output size cannot exceed input size in update
-    val s = buffer.writableSegment(size)
+    if (bufferSize > 0) {
+      // Buffer not empty, need to fill it
+      val remainingBlock = AESEngine.BLOCK_SIZE - bufferSize
+      if (headSize < remainingBlock) {
+        // Can't complete a full block, copy into buffer what is available
+        head.data.copyInto(buffer, bufferSize, head.pos, head.pos + headSize)
+        source.head = head.pop()
+        SegmentPool.recycle(head)
+        bufferSize += headSize
+        return headSize
+      } else {
+        // Complete full block and process
+        head.data.copyInto(buffer, bufferSize, head.pos, head.pos + remainingBlock)
+        bufferSize = 0
 
-    val ciphered = cipher.update(head.data, head.pos, size, s.data, s.limit)
+        val s = sink.buffer.writableSegment(AESEngine.BLOCK_SIZE)
 
-    s.limit += ciphered
-    buffer.size += ciphered
+        cipher.processBlock(buffer, 0, s.data, s.limit)
+        s.limit += AESEngine.BLOCK_SIZE
+        sink.buffer.size += AESEngine.BLOCK_SIZE
 
-    if (s.pos == s.limit) {
-      // We allocated a tail segment, but didn't end up needing it. Recycle!
-      buffer.head = s.pop()
-      SegmentPool.recycle(s)
+        source.size -= remainingBlock
+        head.pos += remainingBlock
+
+        if (head.pos == head.limit) {
+          source.head = head.pop()
+          SegmentPool.recycle(head)
+        }
+
+        return remainingBlock
+      }
     }
 
+    if (headSize < AESEngine.BLOCK_SIZE) {
+      // Can't complete a full block, copy into buffer what is available
+      head.data.copyInto(buffer, 0, head.pos, head.pos + headSize)
+      bufferSize = headSize
+      source.head = head.pop()
+      SegmentPool.recycle(head)
+      return headSize
+    }
+
+    // Process block directly from segment
+    val s = sink.buffer.writableSegment(AESEngine.BLOCK_SIZE)
+
+    cipher.processBlock(head.data, head.pos, s.data, s.limit)
+    s.limit += AESEngine.BLOCK_SIZE
+    sink.buffer.size += AESEngine.BLOCK_SIZE
+
     // Mark those bytes as read.
-    source.size -= size
-    head.pos += size
+    source.size -= AESEngine.BLOCK_SIZE
+    head.pos += AESEngine.BLOCK_SIZE
 
     if (head.pos == head.limit) {
       source.head = head.pop()
       SegmentPool.recycle(head)
     }
-    return size
+
+    return AESEngine.BLOCK_SIZE
   }
 
   override fun flush() =
@@ -89,7 +120,7 @@ private class CipherSink(
     if (closed) return
     closed = true
 
-    var thrown = doFinal()
+    var thrown: Throwable? = doFinal()
 
     try {
       sink.close()
@@ -101,39 +132,33 @@ private class CipherSink(
   }
 
   private fun doFinal(): Throwable? {
-    val outputSize = cipher.getOutputSize(0)
-    if (outputSize == 0) return null
+    if (bufferSize == 0) return null
 
-    var thrown: Throwable? = null
-    val buffer = sink.buffer
+    // Add PKCS7 padding
+    val code = (AESEngine.BLOCK_SIZE - bufferSize).toByte()
+    buffer.fill(code, bufferSize, AESEngine.BLOCK_SIZE)
 
-    // For block cipher, output size cannot exceed block size in doFinal
-    val s = buffer.writableSegment(outputSize)
+    val s = sink.buffer.writableSegment(AESEngine.BLOCK_SIZE)
 
     try {
-      val ciphered = cipher.doFinal(s.data, s.limit)
+      cipher.processBlock(buffer, 0, s.data, s.limit)
 
-      s.limit += ciphered
-      buffer.size += ciphered
+      s.limit += AESEngine.BLOCK_SIZE
+      sink.buffer.size += AESEngine.BLOCK_SIZE
     } catch (e: Throwable) {
-      thrown = e
+      return e
     }
 
-    if (s.pos == s.limit) {
-      buffer.head = s.pop()
-      SegmentPool.recycle(s)
-    }
-
-    return thrown
+    return null
   }
 }
 
 /**
- * Returns a [Sink] that processes data using this [Cipher] while writing to
+ * Returns a [Sink] that processes data using this [BlockCipher] while writing to
  * [sink].
  *
  * @throws IllegalArgumentException
  *  If this isn't a block cipher.
  */
-fun Cipher.sink(sink: BufferedSink): Sink =
+fun BlockCipher.sink(sink: BufferedSink): Sink =
   CipherSink(sink, this)
